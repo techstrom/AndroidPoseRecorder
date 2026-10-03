@@ -9,6 +9,8 @@
             </intent-filter>
         </activity>
         <activity android:name=".PlaybackActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".LibraryActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".VideoImportActivity" android:exported="false" android:screenOrientation="portrait" />
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.files" android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
         </provider>

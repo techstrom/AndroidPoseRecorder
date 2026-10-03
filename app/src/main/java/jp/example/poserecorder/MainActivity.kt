@@ -1,7 +1,6 @@
 package jp.example.poserecorder
 
 import android.Manifest
-import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -11,7 +10,6 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.app.AlertDialog
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
@@ -29,7 +27,6 @@ import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -240,6 +237,7 @@ class MainActivity : ComponentActivity() {
         worker.execute {
             try {
                 val saved = recorder.stop()
+                if (saved != null) RecordingStore(this).use { it.add(saved) }
                 runOnUiThread {
                     isRecording = false
                     record.show(IconButton.Icon.RECORD, "記録開始")
@@ -254,32 +252,7 @@ class MainActivity : ComponentActivity() {
 
     private fun showRecordings() {
         if (isRecording || changingRecording) return
-        val files = File(filesDir, "recordings").listFiles()?.filter { it.extension == "jsonl" }
-            ?.sortedByDescending { it.lastModified() }.orEmpty()
-        if (files.isEmpty()) {
-            AlertDialog.Builder(this).setTitle("記録一覧").setMessage("記録したデータはありません")
-                .setPositiveButton("閉じる", null).show()
-            return
-        }
-        val date = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm:ss", java.util.Locale.JAPAN)
-        val labels = files.map { "${date.format(java.util.Date(it.lastModified()))}  ·  ${it.length() / 1024} KB" }.toTypedArray()
-        AlertDialog.Builder(this).setTitle("記録一覧").setItems(labels) { _, index ->
-            val file = files[index]
-            AlertDialog.Builder(this).setTitle(labels[index]).setItems(arrayOf("再生", "共有")) { _, action ->
-                if (action == 0) startActivity(Intent(this, PlaybackActivity::class.java).putExtra("recording_name", file.name))
-                else shareFile(file)
-            }.setNegativeButton("戻る", { _, _ -> showRecordings() }).show()
-        }.setNegativeButton("閉じる", null).show()
-    }
-
-    private fun shareFile(file: File) {
-        val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
-        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-            type = "application/x-ndjson"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            clipData = ClipData.newRawUri("姿勢データ", uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }, "姿勢データを共有"))
+        startActivity(Intent(this, LibraryActivity::class.java))
     }
 
     private fun reportFailure(message: String, error: Exception) {
