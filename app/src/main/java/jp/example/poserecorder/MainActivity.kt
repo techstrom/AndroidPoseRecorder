@@ -9,13 +9,15 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.app.AlertDialog
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -43,21 +45,29 @@ class MainActivity : ComponentActivity() {
     private lateinit var preview: PreviewView
     private lateinit var overlay: PoseOverlay
     private lateinit var status: TextView
-    private lateinit var record: Button
-    private lateinit var stop: Button
-    private lateinit var share: Button
+    private lateinit var record: IconButton
+    private lateinit var folder: IconButton
     private lateinit var permissionButton: Button
     private lateinit var recorder: PoseRecorder
     private var landmarker: PoseLandmarker? = null // Access only on worker.
     private var provider: ProcessCameraProvider? = null
     private var analysis: ImageAnalysis? = null
-    private var latestFile: File? = null
     private var lastTimestamp = -1L
     @Volatile private var active = false
     @Volatile private var failed = false
     private var ready = false
     private var changingRecording = false
     private var isRecording = false
+    private var recordingStart = 0L
+    private val handler = Handler(Looper.getMainLooper())
+    private val timer = object : Runnable {
+        override fun run() {
+            if (isRecording && active) {
+                status.text = "● ${formatElapsed(SystemClock.uptimeMillis() - recordingStart)}"
+                handler.postDelayed(this, 100)
+            }
+        }
+    }
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera() else {
             status.text = "カメラの使用を許可してください"
@@ -74,8 +84,6 @@ class MainActivity : ComponentActivity() {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
         recorder = PoseRecorder(File(filesDir, "recordings"))
-        latestFile = File(filesDir, "recordings").listFiles()
-            ?.filter { it.extension == "jsonl" }?.maxByOrNull { it.lastModified() }
         buildUi()
         worker.execute {
             try {
@@ -102,29 +110,37 @@ class MainActivity : ComponentActivity() {
         status = TextView(this).apply {
             text = "カメラを準備しています…"
             textSize = 17f
+            gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             setBackgroundColor(0xAA000000.toInt())
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
         root.addView(status, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(32) })
-        val controls = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(24))
-            setBackgroundColor(0xAA000000.toInt())
+        val controls = FrameLayout(this).apply { setBackgroundColor(0x66000000) }
+        record = IconButton(this, IconButton.Icon.RECORD).apply {
+            show(IconButton.Icon.RECORD, "記録開始")
+            isEnabled = false
+            setOnClickListener { if (isRecording) stopRecording() else startRecording() }
         }
-        val row = LinearLayout(this)
-        record = Button(this).apply { text = "記録"; isEnabled = false; setOnClickListener { startRecording() } }
-        stop = Button(this).apply { text = "停止"; isEnabled = false; setOnClickListener { stopRecording() } }
-        share = Button(this).apply { text = "共有"; isEnabled = latestFile != null; setOnClickListener { shareFile() } }
-        listOf(record, stop, share).forEach { row.addView(it, LinearLayout.LayoutParams(0, dp(56), 1f)) }
-        controls.addView(row)
+        folder = IconButton(this, IconButton.Icon.FOLDER).apply {
+            contentDescription = "記録一覧"
+            setOnClickListener { showRecordings() }
+        }
+        controls.addView(record, FrameLayout.LayoutParams(dp(88), dp(88), Gravity.CENTER))
+        controls.addView(folder, FrameLayout.LayoutParams(dp(64), dp(64), Gravity.CENTER_VERTICAL or Gravity.START).apply { leftMargin = dp(24) })
         permissionButton = Button(this).apply {
             text = "カメラ権限の設定"
             visibility = android.view.View.GONE
             setOnClickListener { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) }
         }
-        controls.addView(permissionButton)
-        root.addView(controls, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        root.addView(permissionButton, FrameLayout.LayoutParams(-1, dp(56), Gravity.TOP).apply { topMargin = dp(96) })
+        root.addView(controls, FrameLayout.LayoutParams(-1, dp(104), Gravity.BOTTOM).apply { bottomMargin = dp(24) })
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val safe = insets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            (controls.layoutParams as FrameLayout.LayoutParams).apply { bottomMargin = safe.bottom + dp(12); controls.layoutParams = this }
+            (status.layoutParams as FrameLayout.LayoutParams).apply { topMargin = safe.top + dp(12); status.layoutParams = this }
+            insets
+        }
         setContentView(root)
     }
 
@@ -175,8 +191,6 @@ class MainActivity : ComponentActivity() {
                 val image = BitmapImageBuilder(rotated).build()
                 val result = try { detector.detectForVideo(image, timestamp) } finally { image.close() }
                 recorder.append(result, timestamp, rotated.width, rotated.height)
-                val count = recorder.frames
-                val recording = recorder.recording
                 val w = rotated.width
                 val h = rotated.height
                 runOnUiThread {
@@ -184,8 +198,8 @@ class MainActivity : ComponentActivity() {
                     ready = true
                     overlay.update(result, w, h)
                     if (!changingRecording) {
-                        record.isEnabled = !isRecording
-                        status.text = if (recording) "● 記録中  $count フレーム" else
+                        record.isEnabled = true
+                        if (!isRecording) status.text =
                             if (result.landmarks().isEmpty()) "人が写るようにカメラを向けてください" else "姿勢を検出中 · 33点"
                     }
                 }
@@ -202,15 +216,18 @@ class MainActivity : ComponentActivity() {
         if (!ready || changingRecording || isRecording || failed) return
         changingRecording = true
         record.isEnabled = false
-        share.isEnabled = false
+        folder.isEnabled = false
         worker.execute {
             try {
-                recorder.start(SystemClock.uptimeMillis())
+                val start = SystemClock.uptimeMillis()
+                recorder.start(start)
                 runOnUiThread {
                     changingRecording = false
                     isRecording = true
-                    stop.isEnabled = active
-                    status.text = "● 記録中"
+                    recordingStart = start
+                    record.show(IconButton.Icon.STOP, "記録停止")
+                    record.isEnabled = active
+                    handler.post(timer)
                 }
             } catch (e: Exception) { reportFailure("記録を開始できません", e) }
         }
@@ -219,24 +236,43 @@ class MainActivity : ComponentActivity() {
     private fun stopRecording() {
         changingRecording = true
         record.isEnabled = false
-        stop.isEnabled = false
+        handler.removeCallbacks(timer)
         worker.execute {
             try {
                 val saved = recorder.stop()
                 runOnUiThread {
-                    if (saved != null) latestFile = saved
                     isRecording = false
+                    record.show(IconButton.Icon.RECORD, "記録開始")
                     changingRecording = false
                     record.isEnabled = active && ready && !failed
-                    share.isEnabled = latestFile != null
-                    if (saved != null) status.text = "保存しました: ${saved.name}"
+                    folder.isEnabled = true
+                    if (saved != null) status.text = "保存しました"
                 }
             } catch (e: Exception) { reportFailure("記録の終了に失敗", e) }
         }
     }
 
-    private fun shareFile() {
-        val file = latestFile ?: return
+    private fun showRecordings() {
+        if (isRecording || changingRecording) return
+        val files = File(filesDir, "recordings").listFiles()?.filter { it.extension == "jsonl" }
+            ?.sortedByDescending { it.lastModified() }.orEmpty()
+        if (files.isEmpty()) {
+            AlertDialog.Builder(this).setTitle("記録一覧").setMessage("記録したデータはありません")
+                .setPositiveButton("閉じる", null).show()
+            return
+        }
+        val date = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm:ss", java.util.Locale.JAPAN)
+        val labels = files.map { "${date.format(java.util.Date(it.lastModified()))}  ·  ${it.length() / 1024} KB" }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("記録一覧").setItems(labels) { _, index ->
+            val file = files[index]
+            AlertDialog.Builder(this).setTitle(labels[index]).setItems(arrayOf("再生", "共有")) { _, action ->
+                if (action == 0) startActivity(Intent(this, PlaybackActivity::class.java).putExtra("recording_name", file.name))
+                else shareFile(file)
+            }.setNegativeButton("戻る", { _, _ -> showRecordings() }).show()
+        }.setNegativeButton("閉じる", null).show()
+    }
+
+    private fun shareFile(file: File) {
         val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
         startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
             type = "application/x-ndjson"
@@ -252,13 +288,14 @@ class MainActivity : ComponentActivity() {
             if (isDestroyed) return@runOnUiThread
             ready = false
             record.isEnabled = false
-            stop.isEnabled = false
+            handler.removeCallbacks(timer)
+            isRecording = false
+            record.show(IconButton.Icon.RECORD, "記録開始")
+            folder.isEnabled = true
             status.text = "$message: ${error.localizedMessage}"
             analysis?.clearAnalyzer()
             if (!worker.isShutdown) worker.execute {
-                runCatching { recorder.stop() }.getOrNull()?.let { saved ->
-                    runOnUiThread { latestFile = saved; share.isEnabled = true }
-                }
+                runCatching { recorder.stop() }
             }
         }
     }
@@ -275,6 +312,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         worker.execute {
             runCatching { recorder.stop() }
             landmarker?.close()

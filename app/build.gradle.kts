@@ -20,6 +20,8 @@ android {
     androidResources { noCompress += "task" }
 }
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.camera:camera-core:1.4.2")

@@ -7,9 +7,11 @@ import android.graphics.Paint
 import android.view.View
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import kotlin.math.max
+import kotlin.math.min
 
 class PoseOverlay(context: Context) : View(context) {
-    private var result: PoseLandmarkerResult? = null
+    private var poses: List<List<PosePoint>> = emptyList()
+    var fitInside = false
     private var imageWidth = 1
     private var imageHeight = 1
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -17,20 +19,27 @@ class PoseOverlay(context: Context) : View(context) {
         strokeWidth = resources.displayMetrics.density * 2.5f
     }
     fun update(value: PoseLandmarkerResult?, width: Int = 1, height: Int = 1) {
-        result = value
+        poses = value?.landmarks()?.map { points -> points.map { PosePoint(it.x(), it.y(), it.visibility().orElse(0f)) } } ?: emptyList()
         imageWidth = width
         imageHeight = height
         invalidate()
     }
+    fun update(frame: PoseFrame) {
+        poses = frame.poses
+        imageWidth = frame.width
+        imageHeight = frame.height
+        invalidate()
+    }
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val scale = max(width.toFloat() / imageWidth, height.toFloat() / imageHeight)
+        val scale = if (fitInside) min(width.toFloat() / imageWidth, height.toFloat() / imageHeight)
+            else max(width.toFloat() / imageWidth, height.toFloat() / imageHeight)
         val dx = (width - imageWidth * scale) / 2f
         val dy = (height - imageHeight * scale) / 2f
-        result?.landmarks()?.forEach { points ->
-            fun visible(i: Int) = points[i].visibility().orElse(0f) >= 0.5f
-            fun x(i: Int) = points[i].x() * imageWidth * scale + dx
-            fun y(i: Int) = points[i].y() * imageHeight * scale + dy
+        poses.forEach { points ->
+            fun visible(i: Int) = points[i].visibility >= 0.5f
+            fun x(i: Int) = points[i].x * imageWidth * scale + dx
+            fun y(i: Int) = points[i].y * imageHeight * scale + dy
             connections.forEach { (a, b) ->
                 if (a < points.size && b < points.size && visible(a) && visible(b))
                     canvas.drawLine(x(a), y(a), x(b), y(b), paint)
