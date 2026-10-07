@@ -30,10 +30,6 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -46,10 +42,15 @@ class MainActivity : ComponentActivity() {
     private lateinit var folder: IconButton
     private lateinit var permissionButton: Button
     private lateinit var recorder: PoseRecorder
-    private var landmarker: PoseLandmarker? = null // Access only on worker.
+    private var detector: YoloPoseDetector? = null // Access only on worker.
     private var provider: ProcessCameraProvider? = null
     private var analysis: ImageAnalysis? = null
     private var lastTimestamp = -1L
+    private val tracker = PoseTracker()
+    @Volatile private var selectedCameraPose = -1
+    @Volatile private var cameraPoses: List<List<PosePoint>> = emptyList()
+    @Volatile private var cameraImageWidth = 1
+    @Volatile private var cameraImageHeight = 1
     @Volatile private var active = false
     @Volatile private var failed = false
     private var ready = false
@@ -84,13 +85,7 @@ class MainActivity : ComponentActivity() {
         buildUi()
         worker.execute {
             try {
-                landmarker = PoseLandmarker.createFromOptions(this,
-                    PoseLandmarker.PoseLandmarkerOptions.builder()
-                        .setBaseOptions(BaseOptions.builder().setModelAssetPath("pose_landmarker_lite.task").build())
-                        // Synchronous inference on a background thread. CameraX drops stale frames.
-                        .setRunningMode(RunningMode.VIDEO).setNumPoses(1)
-                        .setMinPoseDetectionConfidence(0.5f).setMinPosePresenceConfidence(0.5f)
-                        .setMinTrackingConfidence(0.5f).build())
+                detector = YoloPoseDetector(this)
             } catch (e: Exception) { reportFailure("姿勢検出の初期化に失敗", e) }
         }
     }
@@ -102,6 +97,18 @@ class MainActivity : ComponentActivity() {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         }
         overlay = PoseOverlay(this)
+        overlay.setOnPoseTapListener { index ->
+            worker.execute {
+                if (tracker.select(cameraPoses, index) != null) {
+                    selectedCameraPose = index
+                    runOnUiThread {
+                        overlay.updatePoses(cameraPoses, cameraImageWidth, cameraImageHeight, index)
+                        status.text = "人物${index + 1}を追跡中 · タップで変更"
+                        if (!isRecording) record.isEnabled = true
+                    }
+                }
+            }
+        }
         root.addView(preview, FrameLayout.LayoutParams(-1, -1))
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
         status = TextView(this).apply {
@@ -176,7 +183,7 @@ class MainActivity : ComponentActivity() {
     private fun analyze(frame: ImageProxy) {
         try {
             if (!active || failed) return
-            val detector = landmarker ?: return
+            val detector = detector ?: return
             val timestamp = maxOf(SystemClock.uptimeMillis(), lastTimestamp + 1)
             lastTimestamp = timestamp
             val original = frame.toBitmap()
@@ -185,19 +192,27 @@ class MainActivity : ComponentActivity() {
             val rotated = Bitmap.createBitmap(cropped, 0, 0, cropped.width, cropped.height,
                 Matrix().apply { postRotate(frame.imageInfo.rotationDegrees.toFloat()) }, true)
             try {
-                val image = BitmapImageBuilder(rotated).build()
-                val result = try { detector.detectForVideo(image, timestamp) } finally { image.close() }
-                recorder.append(result, timestamp, rotated.width, rotated.height)
                 val w = rotated.width
                 val h = rotated.height
+                val poses = detector.detect(rotated)
+                val tracked = tracker.update(poses)
+                selectedCameraPose = tracked
+                if (isRecording) {
+                    recorder.append(poses.getOrNull(tracked), timestamp, w, h)
+                }
                 runOnUiThread {
                     if (!active || failed) return@runOnUiThread
                     ready = true
-                    overlay.update(result, w, h)
+                    cameraPoses = poses; cameraImageWidth = w; cameraImageHeight = h
+                    val trackedForFrame = selectedCameraPose
+                    overlay.updatePoses(poses, w, h, trackedForFrame)
                     if (!changingRecording) {
-                        record.isEnabled = true
-                        if (!isRecording) status.text =
-                            if (result.landmarks().isEmpty()) "人が写るようにカメラを向けてください" else "姿勢を検出中 · 33点"
+                        record.isEnabled = isRecording || selectedCameraPose >= 0
+                        if (!isRecording) status.text = when {
+                            poses.isEmpty() -> "人が写るようにカメラを向けてください"
+                            selectedCameraPose >= 0 -> "人物${selectedCameraPose + 1}を追跡中 · 検出${poses.size}人 · タップで変更"
+                            else -> "検出${poses.size}人 · 追跡する人物をタップしてください"
+                        }
                     }
                 }
             } finally {
@@ -211,6 +226,7 @@ class MainActivity : ComponentActivity() {
 
     private fun startRecording() {
         if (!ready || changingRecording || isRecording || failed) return
+        if (tracker.selectedIndex < 0) { status.text = "追跡する人物をタップしてください"; return }
         changingRecording = true
         record.isEnabled = false
         folder.isEnabled = false
@@ -223,7 +239,7 @@ class MainActivity : ComponentActivity() {
                     isRecording = true
                     recordingStart = start
                     record.show(IconButton.Icon.STOP, "記録停止")
-                    record.isEnabled = active
+                    record.isEnabled = active && tracker.selectedIndex >= 0
                     handler.post(timer)
                 }
             } catch (e: Exception) { reportFailure("記録を開始できません", e) }
@@ -279,7 +295,8 @@ class MainActivity : ComponentActivity() {
         analysis?.clearAnalyzer()
         provider?.unbindAll()
         analysis = null
-        overlay.update(null)
+        overlay.clear()
+        cameraPoses = emptyList(); selectedCameraPose = -1; tracker.reset()
         stopRecording()
         super.onPause()
     }
@@ -288,8 +305,8 @@ class MainActivity : ComponentActivity() {
         handler.removeCallbacksAndMessages(null)
         worker.execute {
             runCatching { recorder.stop() }
-            landmarker?.close()
-            landmarker = null
+            detector?.close()
+            detector = null
         }
         worker.shutdown()
         super.onDestroy()

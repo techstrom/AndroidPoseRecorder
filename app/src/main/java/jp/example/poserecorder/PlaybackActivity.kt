@@ -1,18 +1,21 @@
 package jp.example.poserecorder
 
 import android.graphics.Color
+import android.graphics.Matrix
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.CheckBox
 import android.widget.TextView
-import android.widget.VideoView
 import androidx.activity.ComponentActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -31,7 +34,7 @@ class PlaybackActivity : ComponentActivity() {
     private lateinit var overlay: PoseOverlay
     private lateinit var time: TextView
     private lateinit var play: IconButton
-    private lateinit var video: VideoView
+    private lateinit var video: TextureView
     private lateinit var backgroundToggle: CheckBox
     private lateinit var file: File
     private var reader: BufferedReader? = null // Worker thread only.
@@ -40,6 +43,12 @@ class PlaybackActivity : ComponentActivity() {
     private var lastFrameMs = 0L
     private var generation = 0
     private var foreground = false
+    private var sourceVideoStartMs = 0L
+    private var sourceUri: String? = null
+    private var sourceAspectRatio = 0f
+    private var mediaPlayer: MediaPlayer? = null // Main thread only.
+    private var videoSurface: Surface? = null // Main thread only.
+    private var videoPrepared = false
     private val render = Runnable {
         if (clock.running) {
             pending?.let { frame ->
@@ -75,10 +84,18 @@ class PlaybackActivity : ComponentActivity() {
         val session = runCatching { file.bufferedReader().use { JSONObject(it.readLine() ?: "{}") } }.getOrNull()
         val sourceUri = session?.takeUnless { it.isNull("source_uri") }?.optString("source_uri")?.takeIf { it.isNotBlank() }
             ?: intent.getStringExtra("source_uri")
+        this.sourceUri = sourceUri
         val showVideo = session?.optBoolean("show_video_on_playback")
             ?: intent.getBooleanExtra("show_video", false)
+        sourceVideoStartMs = session?.optLong("source_video_start_ms", 0L)?.coerceAtLeast(0L) ?: 0L
+        sourceAspectRatio = runCatching {
+            file.bufferedReader().use { reader ->
+                reader.readLine()
+                PoseFrame.parse(reader.readLine() ?: "")?.let { it.width.toFloat() / it.height }
+            }
+        }.getOrNull() ?: 0f
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        video = VideoView(this).apply { visibility = View.GONE }
+        video = TextureView(this).apply { visibility = View.GONE }
         root.addView(video, FrameLayout.LayoutParams(-1, -1))
         overlay = PoseOverlay(this).apply { fitInside = true }
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
@@ -90,25 +107,26 @@ class PlaybackActivity : ComponentActivity() {
             visibility = if (sourceUri.isNullOrBlank()) View.GONE else View.VISIBLE
             setOnCheckedChangeListener { _, checked ->
                 video.visibility = if (checked) View.VISIBLE else View.GONE
-                if (checked) { if (video.tag == true && clock.running) video.start() }
-                else if (video.isPlaying) video.pause()
+                if (checked) {
+                    if (video.isAvailable && mediaPlayer == null) prepareVideoPlayer()
+                    if (videoPrepared && clock.running) runCatching { mediaPlayer?.start() }
+                } else if (videoPrepared) runCatching { mediaPlayer?.pause() }
             }
         }
         backgroundToggle.background = android.graphics.drawable.ColorDrawable(0x66000000)
-        // A hidden VideoView has no display surface and cannot prepare its player.
         video.visibility = if (backgroundToggle.isChecked && !sourceUri.isNullOrBlank()) View.VISIBLE else View.GONE
         if (!sourceUri.isNullOrBlank()) {
-            video.setVideoURI(Uri.parse(sourceUri))
-            video.setOnPreparedListener { player ->
-                player.isLooping = false
-                video.tag = true
-                video.seekTo(clock.position(SystemClock.uptimeMillis()).toInt())
-                if (backgroundToggle.isChecked && clock.running) video.start()
-            }
-            video.setOnErrorListener { _, _, _ ->
-                backgroundToggle.isChecked = false
-                time.text = "元動画を開けません"
-                true
+            video.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(surface: android.graphics.SurfaceTexture, width: Int, height: Int) {
+                    applyVideoTransform()
+                    prepareVideoPlayer()
+                }
+                override fun onSurfaceTextureSizeChanged(surface: android.graphics.SurfaceTexture, width: Int, height: Int) = applyVideoTransform()
+                override fun onSurfaceTextureDestroyed(surface: android.graphics.SurfaceTexture): Boolean {
+                    releaseVideoPlayer()
+                    return true
+                }
+                override fun onSurfaceTextureUpdated(surface: android.graphics.SurfaceTexture) = Unit
             }
         }
         root.addView(backgroundToggle, FrameLayout.LayoutParams(-2, dp(56), Gravity.TOP or Gravity.END).apply { rightMargin = dp(12) })
@@ -131,6 +149,7 @@ class PlaybackActivity : ComponentActivity() {
             (video.layoutParams as FrameLayout.LayoutParams).apply {
                 topMargin = safe.top + dp(72); bottomMargin = safe.bottom + dp(116); video.layoutParams = this
             }
+            video.post { applyVideoTransform() }
             insets
         }
         setContentView(root)
@@ -145,8 +164,8 @@ class PlaybackActivity : ComponentActivity() {
         handler.removeCallbacks(render)
         handler.removeCallbacks(ticker)
         clock.reset()
-        if (video.tag == true) video.seekTo(0)
-        overlay.update(null)
+        if (videoPrepared) runCatching { mediaPlayer?.seekTo(sourceVideoStartMs.toInt()) }
+        overlay.clear()
         play.isEnabled = false
         time.text = "読み込み中…"
         val token = generation
@@ -195,7 +214,7 @@ class PlaybackActivity : ComponentActivity() {
     }
     private fun resume() {
         clock.resume(SystemClock.uptimeMillis())
-        if (backgroundToggle.isChecked && video.tag == true && !video.isPlaying) video.start()
+        if (backgroundToggle.isChecked && videoPrepared) runCatching { mediaPlayer?.start() }
         play.show(IconButton.Icon.PAUSE, "一時停止")
         handler.removeCallbacks(ticker)
         handler.post(ticker)
@@ -203,7 +222,7 @@ class PlaybackActivity : ComponentActivity() {
     }
     private fun pause() {
         clock.pause(SystemClock.uptimeMillis())
-        if (video.isPlaying) video.pause()
+        if (videoPrepared) runCatching { mediaPlayer?.pause() }
         handler.removeCallbacks(render)
         handler.removeCallbacks(ticker)
         play.show(IconButton.Icon.PLAY, "再生")
@@ -224,8 +243,62 @@ class PlaybackActivity : ComponentActivity() {
         generation++
         handler.removeCallbacksAndMessages(null)
         worker.execute { reader?.close(); reader = null }
+        releaseVideoPlayer()
         worker.shutdown()
         super.onDestroy()
     }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+    private fun prepareVideoPlayer() {
+        if (mediaPlayer != null || sourceUri.isNullOrBlank() || !video.isAvailable) return
+        runCatching {
+            val surface = Surface(video.surfaceTexture)
+            videoSurface = surface
+            val player = MediaPlayer()
+            mediaPlayer = player
+            player.setDataSource(this, Uri.parse(sourceUri))
+            player.setSurface(surface)
+            player.isLooping = false
+            player.setOnPreparedListener {
+                videoPrepared = true
+                player.seekTo((sourceVideoStartMs + clock.position(SystemClock.uptimeMillis())).toInt())
+                if (backgroundToggle.isChecked && clock.running) player.start()
+            }
+            player.setOnVideoSizeChangedListener { _, _, _ -> applyVideoTransform() }
+            player.setOnErrorListener { _, _, _ ->
+                videoPrepared = false
+                backgroundToggle.isChecked = false
+                time.text = "元動画を開けません"
+                true
+            }
+            player.prepareAsync()
+        }.onFailure {
+            releaseVideoPlayer()
+            backgroundToggle.isChecked = false
+        }
+    }
+
+    /** Letterbox the decoded movie into the same content rectangle PoseOverlay uses. */
+    private fun applyVideoTransform() {
+        if (video.width <= 0 || video.height <= 0 || sourceAspectRatio <= 0f) return
+        val viewAspect = video.width.toFloat() / video.height
+        val scaleX: Float
+        val scaleY: Float
+        if (viewAspect > sourceAspectRatio) {
+            scaleX = sourceAspectRatio / viewAspect
+            scaleY = 1f
+        } else {
+            scaleX = 1f
+            scaleY = viewAspect / sourceAspectRatio
+        }
+        video.setTransform(Matrix().apply { setScale(scaleX, scaleY, video.width / 2f, video.height / 2f) })
+    }
+
+    private fun releaseVideoPlayer() {
+        videoPrepared = false
+        runCatching { mediaPlayer?.reset(); mediaPlayer?.release() }
+        mediaPlayer = null
+        runCatching { videoSurface?.release() }
+        videoSurface = null
+    }
 }

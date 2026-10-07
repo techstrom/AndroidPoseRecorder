@@ -34,6 +34,10 @@ class LibraryActivity : ComponentActivity() {
     private lateinit var count: TextView
     private lateinit var list: ListView
     private val rows = mutableListOf<Recording>()
+    private val selectedIds = linkedSetOf<String>()
+    private lateinit var selectionBar: LinearLayout
+    private lateinit var selectionCount: TextView
+    private var selectionMode = false
     private var total = 0
     private var loading = false
     private var token = 0
@@ -45,12 +49,20 @@ class LibraryActivity : ComponentActivity() {
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val row = convertView as? LinearLayout ?: LinearLayout(this@LibraryActivity).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(12), dp(18), dp(12))
-                addView(TextView(context).apply { textSize = 18f; maxLines = 2 })
-                addView(TextView(context).apply { textSize = 13f; maxLines = 2 })
+                orientation = LinearLayout.HORIZONTAL
+                addView(CheckBox(context).apply { tag = "recording-selection"; isFocusable = false; isClickable = false })
+                val details = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+                details.addView(TextView(context).apply { textSize = 18f; maxLines = 2 })
+                details.addView(TextView(context).apply { textSize = 13f; maxLines = 2 })
+                addView(details, LinearLayout.LayoutParams(0, -2, 1f))
             }
             val item = rows[position]
-            (row.getChildAt(0) as TextView).text = item.name
-            (row.getChildAt(1) as TextView).text = SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.JAPAN).format(Date(item.createdAt)) +
+            val check = row.findViewWithTag<CheckBox>("recording-selection")
+            check.visibility = if (selectionMode) View.VISIBLE else View.GONE
+            check.isChecked = item.id in selectedIds
+            val details = row.getChildAt(1) as LinearLayout
+            (details.getChildAt(0) as TextView).text = item.name
+            (details.getChildAt(1) as TextView).text = SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.JAPAN).format(Date(item.createdAt)) +
                 " · " + (if (item.source == "video") "動画" else "カメラ") +
                 (if (item.tags.isEmpty()) "" else "\n" + item.tags.joinToString("  ") { "#$it" })
             return row
@@ -91,9 +103,24 @@ class LibraryActivity : ComponentActivity() {
         root.addView(sort)
         count = TextView(this).apply { setPadding(dp(8), dp(8), dp(8), dp(8)) }
         root.addView(count)
+        selectionBar = LinearLayout(this).apply {
+            visibility = View.GONE
+            selectionCount = TextView(this@LibraryActivity).apply { gravity = android.view.Gravity.CENTER_VERTICAL }
+            addView(Button(this@LibraryActivity).apply { text = "全選択"; setOnClickListener { toggleVisibleSelection(true) } })
+            addView(selectionCount, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(Button(this@LibraryActivity).apply { text = "削除"; setOnClickListener { confirmDelete(selectedIds.toList()) } })
+            addView(Button(this@LibraryActivity).apply { text = "終了"; setOnClickListener { endSelection() } })
+        }
+        root.addView(selectionBar)
         list = ListView(this).apply {
             adapter = this@LibraryActivity.adapter
-            setOnItemClickListener { _, _, position, _ -> actions(rows[position]) }
+            setOnItemClickListener { _, _, position, _ ->
+                val item = rows[position]
+                if (selectionMode) toggleSelection(item) else actions(item)
+            }
+            setOnItemLongClickListener { _, _, position, _ ->
+                if (!selectionMode) { beginSelection(rows[position]); true } else false
+            }
             setOnScrollListener(object : AbsListView.OnScrollListener {
                 override fun onScrollStateChanged(view: AbsListView?, scrollState: Int) = Unit
                 override fun onScroll(view: AbsListView?, first: Int, visible: Int, all: Int) {
@@ -130,7 +157,7 @@ class LibraryActivity : ComponentActivity() {
     }
     private fun load(reset: Boolean) {
         if (isDestroyed || (!reset && loading)) return
-        if (reset) { token++; rows.clear(); total = 0; adapter.notifyDataSetChanged() }
+        if (reset) { token++; rows.clear(); total = 0; selectedIds.clear(); updateSelectionUi(); adapter.notifyDataSetChanged() }
         val request = token
         val offset = rows.size
         val query = search.text.toString()
@@ -153,7 +180,7 @@ class LibraryActivity : ComponentActivity() {
         }
     }
     private fun actions(item: Recording) {
-        AlertDialog.Builder(this).setTitle(item.name).setItems(arrayOf("再生", "共有", "名前・タグを編集")) { _, action ->
+        AlertDialog.Builder(this).setTitle(item.name).setItems(arrayOf("再生", "共有", "名前・タグを編集", "削除")) { _, action ->
             when(action) {
                 0 -> startActivity(Intent(this, PlaybackActivity::class.java).putExtra("recording_name", item.id)
                     .putExtra("source_uri", item.sourceUri).putExtra("show_video", item.showVideo))
@@ -161,8 +188,58 @@ class LibraryActivity : ComponentActivity() {
                 2 -> editDialog("名前・タグを編集", item.name, item.tags) { name, tags, _ ->
                     worker.execute { try { store.edit(item.id, name, tags); handler.post { if (!isDestroyed) load(true) } } catch (e: Exception) { error(e) } }
                 }
+                3 -> confirmDelete(listOf(item.id))
             }
         }.setNegativeButton("閉じる", null).show()
+    }
+    private fun beginSelection(item: Recording) {
+        selectionMode = true
+        selectedIds.add(item.id)
+        updateSelectionUi()
+        adapter.notifyDataSetChanged()
+    }
+    private fun toggleSelection(item: Recording) {
+        if (!selectedIds.add(item.id)) selectedIds.remove(item.id)
+        updateSelectionUi()
+        adapter.notifyDataSetChanged()
+    }
+    private fun toggleVisibleSelection(select: Boolean) {
+        if (select) rows.forEach { selectedIds.add(it.id) } else selectedIds.removeAll(rows.map { it.id }.toSet())
+        updateSelectionUi()
+        adapter.notifyDataSetChanged()
+    }
+    private fun updateSelectionUi() {
+        if (!::selectionBar.isInitialized) return
+        selectionBar.visibility = if (selectionMode) View.VISIBLE else View.GONE
+        selectionCount.text = "${selectedIds.size} 件選択中"
+    }
+    private fun endSelection() {
+        selectionMode = false
+        selectedIds.clear()
+        updateSelectionUi()
+        adapter.notifyDataSetChanged()
+    }
+    private fun confirmDelete(ids: List<String>) {
+        if (ids.isEmpty()) { Toast.makeText(this, "削除する記録を選択してください", Toast.LENGTH_SHORT).show(); return }
+        AlertDialog.Builder(this)
+            .setTitle("姿勢データを削除")
+            .setMessage("選択した ${ids.size} 件の姿勢データを削除します。元の動画ファイルは削除されません。")
+            .setNegativeButton("キャンセル", null)
+            .setPositiveButton("削除") { _, _ ->
+                selectionMode = false
+                worker.execute {
+                    try {
+                        store.delete(ids)
+                        handler.post {
+                            if (!isDestroyed) {
+                                selectedIds.clear()
+                                Toast.makeText(this, "${ids.size} 件の姿勢データを削除しました", Toast.LENGTH_SHORT).show()
+                                load(true)
+                            }
+                        }
+                    } catch (e: Exception) { error(e) }
+                }
+            }.show()
     }
     private fun editDialog(title: String, initialName: String, initialTags: List<String>, showVideoOption: Boolean = false,
                            save: (String, List<String>, Boolean) -> Unit) {

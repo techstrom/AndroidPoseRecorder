@@ -1,0 +1,12 @@
+YOLOv8n-pose model provenance
+
+Model: Ultralytics yolov8n-pose.pt (official pretrained nano pose weights)
+Export: ONNX, fixed 640x640 input, opset 17, nms=False
+Exported ONNX: yolov8n-pose.onnx
+
+The Ultralytics pretrained model is distributed under AGPL-3.0 by default.
+License information: https://www.ultralytics.com/license
+Model source: https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8n-pose.pt
+Exported from the official weights with Ultralytics 8.4.173.
+
+Runtime: ONNX Runtime for Android 1.24.3 (Maven Central).

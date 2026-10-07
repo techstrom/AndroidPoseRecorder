@@ -1,6 +1,5 @@
 package jp.example.poserecorder
 
-import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedWriter
@@ -21,7 +20,7 @@ class PoseRecorder(private val directory: File) {
     val recording get() = writer != null
 
     fun start(nowMs: Long, source: String = "camera", sourceUri: String? = null,
-              sourceName: String? = null, showVideoOnPlayback: Boolean = false) {
+              sourceName: String? = null, showVideoOnPlayback: Boolean = false, analysisFps: Int? = null) {
         check(!recording)
         check(directory.exists() || directory.mkdirs()) { "保存フォルダーを作成できません" }
         this.source = source
@@ -36,9 +35,12 @@ class PoseRecorder(private val directory: File) {
                 .put("camera", if (source == "camera") "back" else JSONObject.NULL)
                 .put("time_base", if (source == "camera") "uptime" else "video")
                 .put("source_uri", sourceUri).put("source_video_name", sourceName)
+                .put("source_video_start_ms", if (source == "video") nowMs else JSONObject.NULL)
                 .put("show_video_on_playback", showVideoOnPlayback)
+                .put("analysis_fps", if (source == "video") analysisFps ?: JSONObject.NULL else JSONObject.NULL)
+                .put("pose_model", "YOLOv8n-pose ONNX")
                 .put("coordinate_space", if (source == "camera") "rotated_viewport_image_unmirrored" else "upright_video_image_unmirrored")
-                .put("world_unit", "meters").put("landmark_count", 33).toString())
+                .put("world_unit", JSONObject.NULL).put("landmark_count", 33).toString())
             stream.newLine()
             stream.flush()
         } catch (e: Exception) { stream.close(); throw e }
@@ -48,25 +50,22 @@ class PoseRecorder(private val directory: File) {
         writer = stream
     }
 
-    fun append(result: PoseLandmarkerResult, timestampMs: Long, width: Int, height: Int) {
+    fun append(points: List<PosePoint>?, timestampMs: Long, width: Int, height: Int) {
         val stream = writer ?: return
         if (timestampMs < startMs) return
         val poses = JSONArray()
-        result.landmarks().forEachIndexed { poseIndex, points ->
+        if (points != null) {
             val landmarks = JSONArray()
             points.forEachIndexed { index, point ->
-                val world = result.worldLandmarks().getOrNull(poseIndex)?.getOrNull(index)
                 val item = JSONObject().put("index", index)
-                    .put("x", point.x()).put("y", point.y()).put("z", point.z())
-                    .put("visibility", point.visibility().orElse(0f))
-                    .put("presence", point.presence().orElse(0f))
-                if (world != null) item.put("world", JSONObject()
-                    .put("x", world.x()).put("y", world.y()).put("z", world.z()))
+                    .put("x", point.x).put("y", point.y).put("z", 0f)
+                    .put("visibility", point.visibility).put("presence", point.visibility)
                 landmarks.put(item)
             }
             poses.put(JSONObject().put("landmarks", landmarks))
         }
         stream.write(JSONObject().put("type", "frame").put("elapsed_ms", timestampMs - startMs)
+            .put("selected_pose_index", if (points == null) -1 else 0)
             .put(if (source == "camera") "timestamp_monotonic_ms" else "timestamp_video_ms", timestampMs).put("image_width", width)
             .put("image_height", height).put("poses", poses).toString())
         stream.newLine()

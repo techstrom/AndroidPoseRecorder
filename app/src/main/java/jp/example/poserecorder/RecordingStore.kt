@@ -64,6 +64,23 @@ class RecordingStore(context: Context) : SQLiteOpenHelper(context, "recordings.d
             put("name", name.trim()); put("tags", JSONArray(tags).toString()); put("search_tags", tags.joinToString(" ").lowercase(Locale.ROOT))
         }, "id=?", arrayOf(id))
     }
+    /** Deletes only app-owned pose JSONL files and their catalog rows. Source videos are untouched. */
+    fun delete(ids: Collection<String>) {
+        if (ids.isEmpty()) return
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            ids.distinct().forEach { id ->
+                val poseFile = File(directory, id)
+                require(poseFile.parentFile?.canonicalFile == directory.canonicalFile && poseFile.extension == "jsonl") {
+                    "不正な記録ファイルです"
+                }
+                db.delete("recordings", "id=?", arrayOf(id))
+                if (poseFile.exists() && !poseFile.delete()) throw IllegalStateException("姿勢データを削除できません: ${poseFile.name}")
+            }
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
     fun page(query: String, order: Int, offset: Int, limit: Int = 50): Pair<List<Recording>, Int> {
         val sort = when(order) { 1 -> "created_at ASC, id ASC"; 2 -> "name COLLATE NOCASE ASC, id ASC"; 3 -> "name COLLATE NOCASE DESC, id ASC"; else -> "created_at DESC, id ASC" }
         val search = "%" + query.trim().lowercase(Locale.ROOT).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
